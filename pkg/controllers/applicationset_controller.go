@@ -132,9 +132,51 @@ func (r *ApplicationSetReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{RequeueAfter: ReconcileRequeueOnValidationError}, nil
 	}
 
+	currentApplications, err := r.getCurrentApplications(ctx, applicationSetInfo)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	appVersionMap, err := r.buildAppVersionMap(ctx, currentApplications)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	appSyncMap, err := r.buildAppSyncMap(ctx, applicationSetInfo, currentApplications)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// update stateful annotations needed to construct an accurate appSyncMap
+	for i := range currentApplications {
+		currentApplications[i].Annotations["applicationset.argoproj.io/applicationset-version"] = applicationSetInfo.ResourceVersion
+
+		// if the Application is currently "Progressing", we know that the change has started and can remove the pending-change flag
+		if currentApplications[i].Status.Health.Status == "Progressing" {
+			log.Infof("app progressing detected, removing pending annotation: %s", currentApplications[i].Name)
+			desiredApplications[i].Annotations["applicationset.argoproj.io/pending-change"] = "false"
+		}
+	}
+
+	for i := range desiredApplications {
+		desiredApplications[i].Annotations["applicationset.argoproj.io/applicationset-name"] = applicationSetInfo.Name
+		desiredApplications[i].Annotations["applicationset.argoproj.io/applicationset-version"] = applicationSetInfo.ResourceVersion
+
+		// this is workaround to detect the time where an Application resource has been updated, but has not had its state updated yet by the application controllers
+		if desiredApplications[i].Annotations["applicationset.argoproj.io/applicationset-version"] != appVersionMap[desiredApplications[i].Name] {
+			log.Infof("applying pending annotation to: %s, new version: %s vs current version: %s", currentApplications[i].Name, desiredApplications[i].Annotations["applicationset.argoproj.io/applicationset-version"], appVersionMap[desiredApplications[i].Name])
+			desiredApplications[i].Annotations["applicationset.argoproj.io/pending-change"] = "true"
+		}
+	}
+
 	var validApps []argov1alpha1.Application
 	for i := range desiredApplications {
 		if validateErrors[i] == nil {
+			// check appSyncMap to determine which Applications are ready to be updated and which should be skipped
+			if !appSyncMap[desiredApplications[i].Name] {
+				log.Infof("skipping application generation, waiting for previous rollouts to complete before updating: %s", desiredApplications[i].Name)
+				continue
+			}
 			validApps = append(validApps, desiredApplications[i])
 		}
 	}
@@ -348,6 +390,107 @@ func (r *ApplicationSetReconciler) setApplicationSetStatusCondition(ctx context.
 	return nil
 }
 
+// used to hold the current version of an Application resource for easy reference
+func (r *ApplicationSetReconciler) buildAppVersionMap(ctx context.Context, applications []argov1alpha1.Application) (map[string]string, error) {
+	appVersionMap := map[string]string{}
+	for _, app := range applications {
+		appVersionMap[app.Name] = app.Annotations["applicationset.argoproj.io/applicationset-version"]
+	}
+	return appVersionMap, nil
+}
+
+// this map is used to determine which stage of Applications are ready to be updated in the reconciler loop
+func (r *ApplicationSetReconciler) buildAppSyncMap(ctx context.Context, applicationSet argoprojiov1alpha1.ApplicationSet, applications []argov1alpha1.Application) (map[string]bool, error) {
+
+	// this data is expected to be included in the ApplicationSet spec, similar to Rollout or Deployment strategies.
+	selectors := []map[string]string{
+		{"rolloutWave": "tier-5"},
+		{"rolloutWave": "tier-3"},
+	}
+
+	// example spec:
+
+	// apiVersion: argoproj.io/v1alpha2
+	// kind: ApplicationSet
+	// ...
+	// spec:
+	// 	strategy:
+	// 		type: RollingUpdate
+	// 		rollingUpdate:
+	// 			steps:
+	// 				- applicationLabelSelectors:
+	// 						rolloutWave: tier-5  # can be dynamically templated from cluster labels or other parameters
+	// 				- applicationLabelSelectors:
+	// 						rolloutWave: tier-3
+
+	rolloutApps := make([][]string, 0)
+	rolloutStatus := make([]string, 0)
+	for range selectors {
+		rolloutApps = append(rolloutApps, make([]string, 0))
+		rolloutStatus = append(rolloutStatus, "Healthy")
+	}
+
+	appMap := map[string]argov1alpha1.Application{}
+	appRolloutMap := map[string]int{}
+
+	// use applicationLabelSelectors to filter generated Applications into stages and status by name
+	for _, app := range applications {
+		appMap[app.Name] = app
+
+		for i, selector := range selectors {
+
+			selected := true
+			for k := range selector {
+				if val, ok := app.Labels[k]; ok {
+					if val != selector[k] {
+						selected = false
+					}
+				} else {
+					selected = false
+				}
+			}
+
+			if selected {
+				rolloutApps[i] = append(rolloutApps[i], app.Name)
+				appRolloutMap[app.Name] = i
+
+				// check app status
+				if app.Annotations["applicationset.argoproj.io/applicationset-version"] != applicationSet.ResourceVersion {
+					log.Infof("waiting for appset version to match app: %s - %s -> %s", app.Name, app.Annotations["applicationset.argoproj.io/applicationset-version"], applicationSet.ResourceVersion)
+					rolloutStatus[i] = "Pending"
+				}
+				if app.Annotations["applicationset.argoproj.io/pending-change"] == "true" {
+					log.Infof("waiting for pending application change: %s - %s", app.Name, app.Annotations["applicationset.argoproj.io/pending-change"])
+					rolloutStatus[i] = "Pending"
+				}
+				if app.Status.Health.Status != "Healthy" {
+					log.Infof("waiting for app to be healthy: %s - %s", app.Name, app.Status.Health.Status)
+					rolloutStatus[i] = "Pending"
+				}
+			}
+		}
+	}
+
+	appSyncMap := map[string]bool{}
+	syncEnabled := true
+
+	// healthy stages and the first non-healthy stage should have sync enabled
+	// every stage after should have sync disabled
+	for i, status := range rolloutStatus {
+		for _, app := range rolloutApps[i] {
+			appSyncMap[app] = syncEnabled
+		}
+
+		if status != "Healthy" {
+			syncEnabled = false
+		}
+	}
+
+	log.Infof("appSyncMap: %v", appSyncMap)
+
+	return appSyncMap, nil
+}
+
 // validateGeneratedApplications uses the Argo CD validation functions to verify the correctness of the
 // generated applications.
 func (r *ApplicationSetReconciler) validateGeneratedApplications(ctx context.Context, desiredApplications []argov1alpha1.Application, applicationSetInfo argoprojiov1alpha1.ApplicationSet, namespace string) (map[int]error, error) {
@@ -532,6 +675,16 @@ func (r *ApplicationSetReconciler) createOrUpdateInCluster(ctx context.Context, 
 					generatedApp.Annotations = map[string]string{}
 				}
 				generatedApp.Annotations[NotifiedAnnotationKey] = state
+			}
+			// we need to ensure the pending-change annotation is preserved, but still allow the reconciler logic to update it
+			if state, exists := found.ObjectMeta.Annotations["applicationset.argoproj.io/pending-change"]; exists {
+				if generatedApp.Annotations == nil {
+					generatedApp.Annotations = map[string]string{}
+				}
+				// prefer the generated annotation, but fall back to the existing annotation if the generated annotation isn't set
+				if generatedApp.Annotations["applicationset.argoproj.io/pending-change"] == "" {
+					generatedApp.Annotations["applicationset.argoproj.io/pending-change"] = state
+				}
 			}
 			found.ObjectMeta.Annotations = generatedApp.Annotations
 
